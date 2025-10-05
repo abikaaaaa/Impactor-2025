@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+  <meta charset="utf-8" />
+  <title>Asteroid Sim — Cesium (Realism)</title>
+
+  <!-- CesiumJS -->
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.133/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.133/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <div id="topbar">
+    <button id="btnStart">Запустить</button>
+    <button id="btnPause">Пауза</button>
+    <button id="btnReset">Сброс</button>
+    <button id="btnHome" title="Вернуться к обзору">Домой</button>
+
+    <label>Скорость таймера: <input id="speed" type="range" min="0.1" max="5" step="0.1" value="1"></label>
+    <label>Длительность (сек): <input id="duration" type="range" min="10" max="120" step="5" value="40"></label>
+
+    <span class="sep"></span>
+
+    <label>Диаметр (м): <input id="diameter" type="number" min="1" max="20000" step="10" value="120"></label>
+    <label>Плотность (кг/м³): <input id="density" type="number" min="500" max="8000" step="50" value="3000"></label>
+    <label>Скорость (км/с): <input id="speedKms" type="number" min="1" max="70" step="1" value="20"></label>
+    <label>Мощность ракеты (кТ): <input id="yield" type="number" min="1" max="100000" step="10" value="800"></label>
+  </div>
+
+  <div id="cesiumContainer"></div>
+  <div id="infoPanel"></div>
+
+  <script type="module">
+    Cesium.Ion.defaultAccessToken =
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhM2M5NTJhMC0yMTFhLTRmOTctOGIyNy0zMDQ5NjcwNWJmM2YiLCJpZCI6MzQ1MTMxLCJpYXQiOjE3NTkzMzc3ODh9.CAZspvyWzfDYFC6_IcU_nqw0RO-rkDRMWYoTDMoXKA4';
+
+    const viewer = new Cesium.Viewer('cesiumContainer', {
+      terrain: Cesium.Terrain.fromWorldTerrain(),
+      timeline: true,
+      animation: true
+    });
+
+    // UI
+    const btnStart = document.getElementById('btnStart');
+    const btnPause = document.getElementById('btnPause');
+    const btnReset = document.getElementById('btnReset');
+    const btnHome = document.getElementById('btnHome');
+    const speedInput = document.getElementById('speed');
+    const durationInput = document.getElementById('duration');
+
+    const diameterInput = document.getElementById('diameter');
+    const densityInput = document.getElementById('density');
+    const speedKmsInput = document.getElementById('speedKms');
+    const yieldInput = document.getElementById('yield');
+
+    const infoPanel = document.getElementById('infoPanel');
+
+    // Состояние симуляции
+    let simDuration = Number(durationInput.value);
+    let asteroidEntity, missileEntity, flashEntity, wave1Entity, wave2Entity;
+    let interceptHappened = false;
+    let tickHandler;
+
+    // Геометрия/траектория
+    const INTERCEPT_FRACTION = 0.88;
+    const MISSILE_BASE = { lon: -80.604, lat: 28.608, h: 0 }; // мыс Канаверал
+    const MISSILE_FLIGHT_SEC_DEFAULT = 15;
+    const MISSILE_ARC_BOOST = 300000; // ~300 км апогей
+
+    // Эффекты (переопределяются физикой)
+    let FLASH_DURATION = 1.6;
+    let FLASH_MAX_R = 120000.0;
+
+    let WAVE1_DURATION = 9.0;
+    let WAVE1_MIN_R = 50000.0;
+    let WAVE1_MAX_R = 3000000.0;
+
+    let WAVE2_DELAY = 1.2;
+    let WAVE2_DURATION = 12.0;
+    let WAVE2_MIN_R = 200000.0;
+    let WAVE2_MAX_R = 5000000.0;
+
+    // ===== Утилиты форматирования =====
+    function fmtSI(x, unit = '') {
+      if (!isFinite(x)) return '-';
+      const abs = Math.abs(x);
+      const units = [
+        { k: 1e12, s: 'Т' }, { k: 1e9, s: 'Г' }, { k: 1e6, s: 'М' }, { k: 1e3, s: 'к' }
+      ];
+      for (const u of units) if (abs >= u.k) return (x / u.k).toFixed(2) + ' ' + u.s + unit;
+      if (abs >= 1) return x.toFixed(2) + ' ' + unit;
+      if (abs >= 1e-3) return (x * 1e3).toFixed(2) + ' м' + unit;
+      return x.toExponential(2) + ' ' + unit;
+    }
+    function fmtNum(x) { return isFinite(x) ? x.toLocaleString('ru-RU', { maximumFractionDigits: 2 }) : '-'; }
+
+    // ===== Физика/математика =====
+    const TNT_J_PER_KT = 4.184e12;
+    const TNT_J_PER_MT = 4.184e15;
+
+    function computePhysics() {
+      const D = Number(diameterInput.value);
+      const rho = Number(densityInput.value);
+      const v_kms = Number(speedKmsInput.value);
+      const Y_kt = Number(yieldInput.value);
+
+      const r = D / 2;
+      const volume = 4 / 3 * Math.PI * r * r * r;
+      const mass = rho * volume;
+
+      const v = v_kms * 1000;
+      const E_ast = 0.5 * mass * v * v;
+      const E_ast_MT = E_ast / TNT_J_PER_MT;
+
+      const E_miss = Y_kt * TNT_J_PER_KT;
+      const Y_mt = E_miss / TNT_J_PER_MT;
+
+      const E_eff = E_miss + 0.10 * E_ast; // художественно: часть кинетики
+      const W_eff_mt = E_eff / TNT_J_PER_MT;
+
+      const Wc = Math.cbrt(Math.max(W_eff_mt, 0.001));
+      const BASE_KM_PER_MT_CBRT = 600;
+      const R1_max_km = BASE_KM_PER_MT_CBRT * Wc;
+      const R2_max_km = 1.6 * R1_max_km;
+
+      FLASH_MAX_R = Math.max(80e3, 60e3 * Wc);
+      WAVE1_MAX_R = R1_max_km * 1000;
+      WAVE2_MAX_R = R2_max_km * 1000;
+
+      WAVE1_DURATION = 7 + 0.6 * Wc;
+      WAVE2_DURATION = 9 + 0.8 * Wc;
+
+      return { D, rho, v_kms, Y_kt, mass, E_ast, E_ast_MT, E_miss, Y_mt, E_eff, W_eff_mt, Wc, R1_max_km, R2_max_km };
+    }
+
+    function updateInfoPanel(ph, interceptHeightM = null) {
+      const h_km = interceptHeightM != null ? (interceptHeightM / 1000) : null;
+      infoPanel.innerHTML = `
+        <div class="title">Параметры сценария</div>
+        <div class="grid">
+          <div>Диаметр астероида</div><div>${fmtNum(ph.D)} м</div>
+          <div>Плотность</div><div>${fmtNum(ph.rho)} кг/м³</div>
+          <div>Скорость</div><div>${fmtNum(ph.v_kms)} км/с</div>
+          <div>Мощность ракеты</div><div>${fmtNum(ph.Y_kt)} кТ (${ph.Y_mt.toFixed(2)} МТ)</div>
+          <div>Масса астероида</div><div>${fmtSI(ph.mass, 'г')}</div>
+          <div>Кинетическая энергия астероида</div><div>${(ph.E_ast / 1e15).toFixed(2)} ×10<sup>15</sup> Дж (${ph.E_ast_MT.toFixed(2)} МТ)</div>
+          <div>Энергия перехвата (эфф.)</div><div>${(ph.E_eff / 1e15).toFixed(2)} ×10<sup>15</sup> Дж (${ph.W_eff_mt.toFixed(2)} МТ)</div>
+          <div>Пик радиуса волны #1</div><div>${fmtNum(ph.R1_max_km)} км</div>
+          <div>Пик радиуса волны #2</div><div>${fmtNum(ph.R2_max_km)} км</div>
+          ${h_km !== null ? `<div>Высота перехвата</div><div>${fmtNum(h_km)} км</div>` : ''}
+        </div>
+        <div class="note">
+          Примечание: «ударные волны» в вакууме — художественная визуализация расширяющегося облака.<br>
+          Радиусы масштабируются по кубическому корню от энергии (R ∝ W<sup>1/3</sup>).
+        </div>
+      `;
+    }
+
+    function initSimulation() {
+      // Сброс
+      viewer.entities.removeAll();
+      asteroidEntity = missileEntity = flashEntity = wave1Entity = wave2Entity = undefined;
+      interceptHappened = false;
+      if (tickHandler) viewer.clock.onTick.removeEventListener(tickHandler);
+
+      const PH = computePhysics();
+      updateInfoPanel(PH);
+
+      // Время
+      const start = Cesium.JulianDate.now();
+      const stop = Cesium.JulianDate.addSeconds(start, simDuration, new Cesium.JulianDate());
+      viewer.clock.startTime = start.clone();
+      viewer.clock.stopTime = stop.clone();
+      viewer.clock.currentTime = start.clone();
+      viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
+      viewer.clock.multiplier = Number(speedInput.value) || 1.0;
+      viewer.clock.shouldAnimate = false;
+      viewer.timeline.zoomTo(start, stop);
+
+      // ===== Траектория астероида =====
+      const lon1 = -150, lat1 = 0, h1 = 40000000; // ~40 000 км
+      const lon2 = 30, lat2 = 10, h2 = 0;
+
+      const steps = 80;
+      const asteroidPos = new Cesium.SampledPositionProperty();
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const time = Cesium.JulianDate.addSeconds(start, Math.round(t * simDuration), new Cesium.JulianDate());
+        const lon = Cesium.Math.lerp(lon1, lon2, t);
+        const lat = Cesium.Math.lerp(lat1, lat2, t);
+        const h = Cesium.Math.lerp(h1, h2, t) + 200000 * Math.sin(Math.PI * t);
+        asteroidPos.addSample(time, Cesium.Cartesian3.fromDegrees(lon, lat, h));
+      }
+
+      asteroidEntity = viewer.entities.add({
+        id: 'asteroid',
+        position: asteroidPos,
+        point: { pixelSize: 10, color: Cesium.Color.ORANGE, outlineColor: Cesium.Color.BLACK, outlineWidth: 1 },
+        path: { material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.2, color: Cesium.Color.ORANGE }), width: 4, leadTime: 0, trailTime: simDuration }
+      });
+
+      viewer.trackedEntity = asteroidEntity;
+
+      // ===== Перехват =====
+      const interceptTime = Cesium.JulianDate.addSeconds(start, Math.floor(simDuration * INTERCEPT_FRACTION), new Cesium.JulianDate());
+      const interceptCartesian = asteroidPos.getValue(interceptTime);
+      const interceptCarto = Cesium.Ellipsoid.WGS84.cartesianToCartographic(interceptCartesian);
+      updateInfoPanel(PH, interceptCarto.height);
+
+      const secsToIntercept = Cesium.JulianDate.secondsDifference(interceptTime, start);
+      const missileFlightSec = Math.max(5, Math.min(MISSILE_FLIGHT_SEC_DEFAULT, secsToIntercept - 1));
+      const launchTime = Cesium.JulianDate.addSeconds(interceptTime, -missileFlightSec, new Cesium.JulianDate());
+
+      // Траектория ракеты
+      const missilePos = new Cesium.SampledPositionProperty();
+      const mSteps = 40;
+      const lon2deg = Cesium.Math.toDegrees(interceptCarto.longitude);
+      const lat2deg = Cesium.Math.toDegrees(interceptCarto.latitude);
+      const h2m = interceptCarto.height;
+
+      for (let i = 0; i <= mSteps; i++) {
+        const t = i / mSteps;
+        const time = Cesium.JulianDate.addSeconds(launchTime, Math.round(t * missileFlightSec), new Cesium.JulianDate());
+        const lon = Cesium.Math.lerp(MISSILE_BASE.lon, lon2deg, t);
+        const lat = Cesium.Math.lerp(MISSILE_BASE.lat, lat2deg, t);
+        const h = Cesium.Math.lerp(MISSILE_BASE.h, h2m, t) + MISSILE_ARC_BOOST * Math.sin(Math.PI * t);
+        missilePos.addSample(time, Cesium.Cartesian3.fromDegrees(lon, lat, h));
+      }
+
+      missileEntity = viewer.entities.add({
+        id: 'missile',
+        position: missilePos,
+        label: {
+          text: 'Ракета',
+          font: 'bold 14px sans-serif',
+          fillColor: Cesium.Color.WHITE,
+          pixelOffset: new Cesium.Cartesian2(0, -18),
+          showBackground: true,
+          backgroundColor: Cesium.Color.BLACK.withAlpha(0.5),
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM
+        },
+        point: { pixelSize: 8, color: Cesium.Color.CYAN, outlineColor: Cesium.Color.BLACK, outlineWidth: 1 },
+        path: { material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.2, color: Cesium.Color.CYAN }), width: 3, leadTime: 0, trailTime: missileFlightSec + 2 },
+        availability: new Cesium.TimeIntervalCollection([new Cesium.TimeInterval({ start: launchTime, stop: interceptTime })])
+      });
+
+      // Эффекты
+      function startEffects() {
+        // Вспышка
+        const flashStart = interceptTime.clone();
+        const flashEnd = Cesium.JulianDate.addSeconds(flashStart, FLASH_DURATION, new Cesium.JulianDate());
+        const flashR = new Cesium.CallbackProperty((time) => {
+          const s = Cesium.JulianDate.secondsDifference(time, flashStart);
+          const t = Cesium.Math.clamp(s, 0, FLASH_DURATION);
+          const r = 100.0 + (t / FLASH_DURATION) * FLASH_MAX_R;
+          return new Cesium.Cartesian3(r, r, r);
+        }, false);
+        const flashColor = new Cesium.CallbackProperty((time) => {
+          const s = Cesium.JulianDate.secondsDifference(time, flashStart);
+          const t = Cesium.Math.clamp(s / FLASH_DURATION, 0, 1);
+          return Cesium.Color.ORANGE.withAlpha(0.9 * (1 - t));
+        }, false);
+        flashEntity = viewer.entities.add({
+          position: interceptCartesian,
+          ellipsoid: { radii: flashR, material: new Cesium.ColorMaterialProperty(flashColor) },
+          availability: new Cesium.TimeIntervalCollection([new Cesium.TimeInterval({ start: flashStart, stop: flashEnd })])
+        });
+
+        // Волна #1
+        const w1Start = interceptTime.clone();
+        const w1End = Cesium.JulianDate.addSeconds(w1Start, WAVE1_DURATION, new Cesium.JulianDate());
+        const w1R = new Cesium.CallbackProperty((time) => {
+          const s = Cesium.JulianDate.secondsDifference(time, w1Start);
+          const t = Cesium.Math.clamp(s, 0, WAVE1_DURATION);
+          const r = WAVE1_MIN_R + (t / WAVE1_DURATION) * (WAVE1_MAX_R - WAVE1_MIN_R);
+          return new Cesium.Cartesian3(r, r, r);
+        }, false);
+        const w1Color = new Cesium.CallbackProperty((time) => {
+          const s = Cesium.JulianDate.secondsDifference(time, w1Start);
+          const t = Cesium.Math.clamp(s / WAVE1_DURATION, 0, 1);
+          return Cesium.Color.WHITE.withAlpha(0.42 * (1 - t));
+        }, false);
+        wave1Entity = viewer.entities.add({
+          position: interceptCartesian,
+          ellipsoid: { radii: w1R, material: new Cesium.ColorMaterialProperty(w1Color) },
+          availability: new Cesium.TimeIntervalCollection([new Cesium.TimeInterval({ start: w1Start, stop: w1End })])
+        });
+
+        // Волна #2
+        const w2Start = Cesium.JulianDate.addSeconds(interceptTime, 1.2, new Cesium.JulianDate());
+        const w2End = Cesium.JulianDate.addSeconds(w2Start, WAVE2_DURATION, new Cesium.JulianDate());
+        const w2R = new Cesium.CallbackProperty((time) => {
+          const s = Cesium.JulianDate.secondsDifference(time, w2Start);
+          const t = Cesium.Math.clamp(s, 0, WAVE2_DURATION);
+          const r = WAVE2_MIN_R + (t / WAVE2_DURATION) * (WAVE2_MAX_R - WAVE2_MIN_R);
+          return new Cesium.Cartesian3(r, r, r);
+        }, false);
+        const w2Color = new Cesium.CallbackProperty((time) => {
+          const s = Cesium.JulianDate.secondsDifference(time, w2Start);
+          const t = Cesium.Math.clamp(s / WAVE2_DURATION, 0, 1);
+          return Cesium.Color.WHITE.withAlpha(0.28 * (1 - t));
+        }, false);
+        wave2Entity = viewer.entities.add({
+          position: interceptCartesian,
+          ellipsoid: { radii: w2R, material: new Cesium.ColorMaterialProperty(w2Color) },
+          availability: new Cesium.TimeIntervalCollection([new Cesium.TimeInterval({ start: w2Start, stop: w2End })])
+        });
+
+        // Конец симуляции после второй волны (без flyTo)
+        viewer.clock.stopTime = Cesium.JulianDate.addSeconds(w2End, 0.5, new Cesium.JulianDate());
+      }
+
+      // Тики
+      tickHandler = function (clock) {
+        if (!interceptHappened && Cesium.JulianDate.compare(clock.currentTime, interceptTime) >= 0) {
+          interceptHappened = true;
+          if (asteroidEntity) asteroidEntity.show = false;
+          if (missileEntity) missileEntity.show = false;
+          startEffects();
+        }
+      };
+      viewer.clock.onTick.addEventListener(tickHandler);
+    }
+
+    // ==== Инициализация и UI ====
+    initSimulation();
+
+    btnStart.addEventListener('click', () => viewer.clock.shouldAnimate = true);
+    btnPause.addEventListener('click', () => viewer.clock.shouldAnimate = false);
+    btnReset.addEventListener('click', () => { viewer.clock.shouldAnimate = false; initSimulation(); });
+
+    // Домой: вернуть камеру к дефолтному обзору
+    btnHome.addEventListener('click', () => {
+      viewer.camera.flyHome(1.2);
+    });
+
+    speedInput.addEventListener('input', () => { viewer.clock.multiplier = Number(speedInput.value); });
+    durationInput.addEventListener('input', () => { simDuration = Number(durationInput.value); initSimulation(); });
+
+    [diameterInput, densityInput, speedKmsInput, yieldInput].forEach(el => {
+      el.addEventListener('change', () => initSimulation());
+      el.addEventListener('keyup', (e) => { if (e.key === 'Enter') initSimulation(); });
+    });
+  </script>
+</body>
+
+</html>
